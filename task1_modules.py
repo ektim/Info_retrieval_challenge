@@ -19,6 +19,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 import xgboost as xgb
+from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 
 import nltk
 from nltk.corpus import stopwords
@@ -932,3 +933,217 @@ def evaluate_recommendations(gold_mapping, recommendations, k=100):
     mAP = mean_average_precision(true_labels, predicted_labels, k)
     return recall, mAP
 
+
+#################################################################
+# Helping functions
+def create_corpus(corpus, text_type):
+    """
+    Extracts text data from a corpus based on the specified text type.
+
+    Parameters:
+    corpus (list): List of dictionaries representing patent documents.
+    text_type (str): Type of text to extract ('title', 'abstract', 'claim1', 'claims', 'description', 'fulltext').
+
+    Returns:
+    list: List of dictionaries with 'id' and 'text' keys representing each document in the corpus.
+    """
+
+    app_ids = [doc['Application_Number'] + doc['Application_Category'] for doc in corpus]
+
+    cnt = 0 # count the number of documents without text
+    texts = []  # list of texts
+    ids_to_remove = []  # list of ids of documents without text, to remove them from the corpus
+
+    if text_type == 'title':
+        for doc in corpus:
+            try:
+                texts.append(doc['Content']['title'])
+            except: # if the document does not have a title
+                ids_to_remove.append(doc['Application_Number']+doc['Application_Category'])
+                cnt += 1
+        print(f"Number of documents without title: {cnt}")
+
+    elif text_type == 'abstract':
+        for doc in corpus:
+            try:
+                texts.append(doc['Content']['pa01'])
+            except: # if the document does not have an abstract
+                ids_to_remove.append(doc['Application_Number']+doc['Application_Category'])
+                cnt += 1
+        print(f"Number of documents without abstract: {cnt}")
+
+    elif text_type == 'claim1':
+        for doc in corpus:
+            try:
+                texts.append(doc['Content']['c-en-0001'])
+            except: # if the document does not have claim 1
+                ids_to_remove.append(doc['Application_Number']+doc['Application_Category'])
+                cnt += 1
+        print(f"Number of documents without claim 1: {cnt}")
+
+    elif text_type == 'claims':
+        # all the values with the key starting with 'c-en-', each element in the final list is a list of claims
+        for doc in corpus:
+            doc_claims = []
+            for key in doc['Content'].keys():
+                if key.startswith('c-en-'):
+                    doc_claims.append(doc['Content'][key])
+            if len(doc_claims) == 0:    # if the document does not have any claims
+                ids_to_remove.append(doc['Application_Number']+doc['Application_Category'])
+                cnt += 1
+            else:
+                doc_text_string = ' '.join(doc_text)
+                texts.append(doc_text_string)
+        print(f"Number of documents without claims: {cnt}")
+
+    elif text_type == 'description':
+        # all the values with the key starting with 'p'
+        for doc in corpus:
+            doc_text = []
+            for key in doc['Content'].keys():
+                if key.startswith('p'):
+                    doc_text.append(doc['Content'][key])
+            if len(doc_text) == 0:  # if the document does not have any description
+                ids_to_remove.append(doc['Application_Number']+doc['Application_Category'])
+                cnt += 1
+            else:
+                doc_text_string = ' '.join(doc_text)
+                texts.append(doc_text_string)
+        print(f"Number of documents without description: {cnt}")
+
+    elif text_type == 'fulltext':
+        for doc in corpus:
+            doc_text = list(doc['Content'].values())
+            doc_text_string = ' '.join(doc_text)
+            texts.append(doc_text_string)
+        if cnt > 0:
+            print(f"Number of documents without any text: {cnt}")
+
+    else:
+        raise ValueError("Invalid text type")
+
+    if len(ids_to_remove) > 0:
+        print(f"Removing {len(ids_to_remove)} documents without required text")
+        for id_ in ids_to_remove[::-1]:
+            idx = app_ids.index(id_)
+            del app_ids[idx]
+
+    # Create a list of dictionaries with app_ids and texts
+    corpus_data = [{'id': app_id, 'text': text} for app_id, text in zip(app_ids, texts)]
+
+    return corpus_data
+
+def top_k_ranks(citing, cited, cosine_similarities, k=10):
+    # Create a dictionary to store the top k ranks for each citing patent
+    top_k_ranks = {}
+    for i, content_id in enumerate(citing):
+        top_k_ranks[content_id['id']] = [cited[j]['id'] for j in np.argsort(cosine_similarities[i])[::-1][:k]]
+    return top_k_ranks
+
+def mean_ranking(true_labels, predicted_labels):
+    """
+    Calculate the mean of lists of the mean rank of true relevant items
+    in the lists of sorted recommended items.
+
+    Parameters:
+    true_labels : list of list
+        True relevant items for each recommendation list.
+    predicted_labels : list of list
+        Predicted recommended items for each recommendation list.
+
+    Returns:
+    float
+        Mean of lists of the mean rank of true relevant items.
+    """
+    mean_ranks = []
+
+    for true, pred in zip(true_labels, predicted_labels):
+        # Calculate the rank of true relevant items
+        # in the recommendation list
+        ranks = []
+        for item in true:
+            try:
+                rank = pred.index(item) + 1
+            except ValueError:
+                rank = len(pred)  # If item not found, assign the length of the list
+            ranks.append(rank)
+
+        # Calculate the mean rank of true relevant items
+        # in the recommendation list
+        mean_rank = sum(ranks) / len(ranks)
+        mean_ranks.append(mean_rank)
+
+    # Calculate the mean of the mean ranks across all recommendation lists
+    mean_of_mean_ranks = sum(mean_ranks) / len(mean_ranks)
+
+    return mean_of_mean_ranks
+
+#################################################################
+# Doc2Vec
+def train_doc2vec_model(corpus, vector_size=100, window=5, min_count=5, workers=4, epochs=20):
+    """Trains a Doc2Vec model using the provided corpus."""
+    tagged_data = [TaggedDocument(words=word_tokenize(_d['text'].lower()), tags=[str(_d['id'])]) for _d in corpus]
+    model = Doc2Vec(tagged_data, vector_size=vector_size, window=window, min_count=min_count, workers=workers, epochs=epochs)
+    return model
+
+def create_doc2vec_embeddings(corpus, doc2vec_model):
+    """Creates document embeddings using Doc2Vec."""
+    document_embeddings = []
+    for doc in tqdm(corpus, desc="Generating Embeddings"):
+        document_embeddings.append(doc2vec_model.infer_vector(word_tokenize(doc['text'].lower())))
+    return np.array(document_embeddings)
+
+#################################################################
+# sBert-L12
+def create_combined_corpus(corpus, column_names):
+    combined_corpus = []
+    for doc in tqdm(corpus, desc="Combining columns"):
+        parts = []
+        content = doc.get('Content', {})
+        for column_name in column_names:
+            if (column_name == "title"):
+                title = content.get('title', '')
+                parts.append(title)
+            if (column_name == "description"):
+                description = [text for key, text in content.items() if key.startswith('p') and key != 'pa01']
+                parts.extend(description)
+        combined_corpus.append({'id': doc['Application_Number'] + doc['Application_Category'], 'text': " ".join(parts)})
+    return combined_corpus
+
+def prepare_training_data_sbert_l12(citing_ids, nonciting_ids, sim_matrix, gold_mapping, top_k_candidates=100):
+    X = []
+    y = []
+    for idx, pid in enumerate(citing_ids):
+        if pid not in gold_mapping:
+            continue
+        gold_ids = set(gold_mapping[pid])
+        candidate_indices = np.argsort(sim_matrix[idx])[::-1][:top_k_candidates]
+        for cand_idx in candidate_indices:
+            feature = [sim_matrix[idx, cand_idx]]
+            # Use nonciting_ids for comparison
+            label = 1 if nonciting_ids[cand_idx] in gold_ids else 0
+            X.append(feature)
+            y.append(label)
+    return np.array(X), np.array(y)
+
+def evaluate_recommendations_sbert_l12(gold_mapping, recommendations, k=100):
+    true_labels = []
+    predicted_labels = []
+    for pid, gold in gold_mapping.items():
+        if pid in recommendations:
+            true_labels.append(gold)
+            predicted_labels.append(recommendations[pid])
+    recall = mean_recall_at_k(true_labels, predicted_labels, k=k)
+    mAP = mean_average_precision(true_labels, predicted_labels, k=k)
+    return recall, mAP
+
+def re_rank_candidates_sbert_l12(ids, nonciting_ids, baseline_sim_matrix, re_rank_model, top_k_candidates=100):
+    re_ranked = {}
+    for idx, pid in enumerate(ids):
+        candidate_indices = np.argsort(baseline_sim_matrix[idx])[::-1][:top_k_candidates]
+        features = np.array([[baseline_sim_matrix[idx, cand_idx]] for cand_idx in candidate_indices])
+        probas = re_rank_model.predict_proba(features)[:, 1]
+        sorted_order = np.argsort(probas)[::-1]
+        re_ranked_ids = [nonciting_ids[candidate_indices[i]] for i in sorted_order]
+        re_ranked[pid] = re_ranked_ids
+    return re_ranked
